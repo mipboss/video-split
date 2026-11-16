@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-video_splitter.py — Batch-split videos into fixed-length clips (default 15 min)
-ready for sharing on WhatsApp and YouTube.
+video_splitter.py — Batch-split videos into clips ready for sharing on WhatsApp
+and YouTube. YouTube clips have a fixed length (default 15 min); WhatsApp clips
+are as long as WhatsApp's file size limit allows (default 2 GB).
 
 Requires: Python 3.8+ and ffmpeg/ffprobe on your PATH.
   Mac:     brew install ffmpeg
@@ -14,8 +15,11 @@ Examples
   # Split everything under two folders, output both YouTube and WhatsApp versions
   python video_splitter.py "D:/Videos/2024" "D:/Videos/Family" -o "D:/Clips"
 
-  # Only WhatsApp-friendly clips, 10-minute length, 2 files at a time
-  python video_splitter.py ~/Movies -o ~/Clips --profile whatsapp --minutes 10 --jobs 2
+  # Only WhatsApp clips small enough to send as a normal video, 2 files at a time
+  python video_splitter.py ~/Movies -o ~/Clips --profile whatsapp --wa-limit-mb 64 --jobs 2
+
+  # YouTube clips of 10 minutes
+  python video_splitter.py ~/Movies -o ~/Clips --profile youtube --minutes 10
 
   # See what would happen without doing anything
   python video_splitter.py ~/Movies -o ~/Clips --dry-run
@@ -30,8 +34,12 @@ Profiles
             Use --exact to re-encode for frame-accurate 15:00 cuts.
   whatsapp  Re-encodes to H.264/AAC MP4, max 720p, "fast start" so it plays
             while downloading. Much smaller files that WhatsApp accepts and
-            plays on any phone. Clips are cut exactly at 15:00.
-            Use --wa-height 1080 to keep full HD (bigger files).
+            plays on any phone. Each video is split into as few clips as fit
+            under WhatsApp's size limit, all about the same size, so there is
+            never a tiny last piece. Short videos stay in one piece.
+            --wa-limit-mb 2000 (default) for sending as a Document (up to 2 GB);
+            --wa-limit-mb 64 for sending as a normal video that plays in the chat.
+            Use --wa-height 1080 to keep full HD (bigger files, so more clips).
   both      (default) produces both, in separate sub-folders.
 
 YouTube upload (optional, --upload or the checkbox in the window)
@@ -59,7 +67,10 @@ YouTube upload (optional, --upload or the checkbox in the window)
 """
 
 import argparse
+import bisect
+import itertools
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -73,6 +84,9 @@ VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".wmv", ".mts", ".m2ts", "
 YT_COPY_VCODECS = {"h264", "hevc"}
 YT_COPY_ACODECS = {"aac", "mp3"}
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # stop console pop-ups on Windows
+WA_KEYINT = 2      # seconds between keyframes in WhatsApp encodes, so cuts can land almost anywhere
+WA_MARGIN = 0.97   # aim this far under the WhatsApp size limit, to leave room for container overhead
+WA_LIMITS = {"2 GB – send as Document": 2000, "64 MB – send as video": 64}  # window choices, in MB
 
 _cancel = threading.Event()  # set by the GUI's Stop button
 _procs = set()               # running ffmpeg processes, so Stop can kill them
@@ -157,6 +171,10 @@ def find_videos(inputs, warn=print):
 def fmt_time(sec):
     sec = int(sec)
     return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
+
+
+def fmt_size(n):
+    return f"{n / 1e9:.2f} GB" if n >= 1e9 else f"{n / 1e6:.0f} MB"
 
 
 # ---------------------------------------------------------------- youtube upload
@@ -329,39 +347,137 @@ def upload_clips(dest_dir, name, args, emit, activity):
 
 
 # ---------------------------------------------------------------- core
-def build_cmd(src, info, out_pattern, profile, seg_sec, exact, crf_wa, crf_yt, wa_height):
-    base = [tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-            "-i", str(src), "-map", "0:v:0"]
-    if info["has_audio"]:
-        base += ["-map", "0:a:0"]
+FFMPEG_ARGS = ["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+SEGMENT_ARGS = ["-reset_timestamps", "1", "-segment_format", "mp4",
+                "-segment_format_options", "movflags=+faststart", "-segment_start_number", "1"]
 
-    if profile == "youtube":
-        can_copy = (info["vcodec"] in YT_COPY_VCODECS and
-                    (not info["has_audio"] or info["acodec"] in YT_COPY_ACODECS))
-        if can_copy and not exact:
-            codec = ["-c", "copy"]
-            mode = "copy (no quality loss)"
-        else:
-            codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf_yt),
-                     "-pix_fmt", "yuv420p",
-                     "-force_key_frames", f"expr:gte(t,n_forced*{seg_sec})",
-                     "-c:a", "aac", "-b:a", "192k"]
-            mode = f"re-encode H.264 CRF {crf_yt}"
-    else:  # whatsapp
-        scale = f"scale=-2:'min({wa_height},ih)'"
-        level = "4.0" if wa_height <= 720 else "4.2"  # 4.2 covers 1080p at 60 fps
-        codec = ["-vf", scale, "-c:v", "libx264", "-preset", "veryfast",
-                 "-crf", str(crf_wa), "-profile:v", "high", "-level", level,
+
+def ffmpeg_input(src, info):
+    cmd = [tool("ffmpeg")] + FFMPEG_ARGS + ["-i", str(src), "-map", "0:v:0"]
+    return cmd + (["-map", "0:a:0"] if info["has_audio"] else [])
+
+
+def youtube_cmd(src, info, out_pattern, seg_sec, exact, crf_yt):
+    can_copy = (info["vcodec"] in YT_COPY_VCODECS and
+                (not info["has_audio"] or info["acodec"] in YT_COPY_ACODECS))
+    if can_copy and not exact:
+        codec = ["-c", "copy"]
+        mode = "copy (no quality loss)"
+    else:
+        codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf_yt),
                  "-pix_fmt", "yuv420p",
                  "-force_key_frames", f"expr:gte(t,n_forced*{seg_sec})",
-                 "-c:a", "aac", "-b:a", "128k", "-ac", "2"]
-        mode = f"re-encode {min(wa_height, info['height'] or wa_height)}p H.264 CRF {crf_wa}"
+                 "-c:a", "aac", "-b:a", "192k"]
+        mode = f"re-encode H.264 CRF {crf_yt}"
+    seg = ["-f", "segment", "-segment_time", str(seg_sec), "-segment_time_delta", "0.05"]
+    return ffmpeg_input(src, info) + codec + seg + SEGMENT_ARGS + [str(out_pattern)], mode
 
-    seg = ["-f", "segment", "-segment_time", str(seg_sec),
-           "-segment_time_delta", "0.05", "-reset_timestamps", "1", "-segment_format", "mp4",
-           "-segment_format_options", "movflags=+faststart",
-           "-segment_start_number", "1", str(out_pattern)]
-    return base + codec + seg, mode
+
+def whatsapp_encode_cmd(src, info, out, crf_wa, wa_height):
+    """Encode the whole video once; it is split afterwards, once its real size is known."""
+    level = "4.0" if wa_height <= 720 else "4.2"  # 4.2 covers 1080p at 60 fps
+    codec = ["-vf", f"scale=-2:'min({wa_height},ih)'", "-c:v", "libx264", "-preset", "veryfast",
+             "-crf", str(crf_wa), "-profile:v", "high", "-level", level, "-pix_fmt", "yuv420p",
+             "-force_key_frames", f"expr:gte(t,n_forced*{WA_KEYINT})",
+             "-c:a", "aac", "-b:a", "128k", "-ac", "2"]
+    mode = f"re-encode {min(wa_height, info['height'] or wa_height)}p H.264 CRF {crf_wa}"
+    return ffmpeg_input(src, info) + codec + [str(out)], mode
+
+
+def packet_sizes(path):
+    """Return the file's packets as sorted (time, bytes), and the video keyframe times."""
+    out = run([tool("ffprobe"), "-v", "error", "-show_entries",
+               "packet=stream_index,pts_time,size,flags", "-of", "compact=p=0", str(path)])
+    if out.returncode != 0:
+        raise RuntimeError(out.stderr.strip() or "ffprobe failed")
+    pkts, keys = [], []
+    for line in out.stdout.splitlines():
+        f = dict(kv.split("=", 1) for kv in line.split("|") if "=" in kv)
+        try:
+            t, size = float(f["pts_time"]), int(f["size"])
+        except (KeyError, ValueError):
+            continue
+        pkts.append((t, size))
+        if f.get("stream_index") == "0" and "K" in f.get("flags", ""):
+            keys.append(t)
+    pkts.sort()
+    return pkts, sorted(keys)
+
+
+def size_cuts(pkts, keys, n):
+    """Keyframe times that split the file into n parts of about equal size."""
+    times = [t for t, _ in pkts]
+    cum = list(itertools.accumulate(size for _, size in pkts))
+    before = [(k, cum[i - 1] if i else 0) for k in keys if k > 0
+              for i in [bisect.bisect_left(times, k)]]
+    cuts = []
+    for part in range(1, n):
+        goal = cum[-1] * part / n
+        t = min(before, key=lambda kb: abs(kb[1] - goal))[0]
+        if not cuts or t > cuts[-1]:
+            cuts.append(t)
+    return cuts
+
+
+def split_copy_cmd(full, cuts, out_pattern):
+    cmd = [tool("ffmpeg")] + FFMPEG_ARGS + ["-i", str(full), "-map", "0", "-c", "copy"]
+    if not cuts:
+        return cmd + ["-movflags", "+faststart", str(out_pattern) % 1]
+    # Cut just before each keyframe so rounding can't push the cut to the next one.
+    times = ",".join(f"{max(c - 0.001, 0):.3f}" for c in cuts)
+    return cmd + ["-f", "segment", "-segment_times", times] + SEGMENT_ARGS + [str(out_pattern)]
+
+
+def make_whatsapp(src, info, dest_dir, args, activity=None):
+    """Encode for WhatsApp, then split into the fewest equal-size clips under the limit."""
+    limit = int(args.wa_limit_mb * 1_000_000)
+    target = limit * WA_MARGIN
+    full = dest_dir / f".{src.stem}.encoding.mp4"
+    pattern = dest_dir / f"{src.stem}_part%02d.mp4"
+    cmd, mode = whatsapp_encode_cmd(src, info, full, args.wa_crf, args.wa_height)
+    try:
+        if activity:
+            activity(f"Encoding {src.name} for WhatsApp…")
+        r = run(cmd)
+        if _cancel.is_set():
+            raise Stopped()
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.strip()[-400:])
+        n = max(1, math.ceil(full.stat().st_size / target))
+        pkts = keys = None
+        for _ in range(5):  # equal-size cuts nearly always fit first time; add a part if not
+            if n > 1 and pkts is None:
+                pkts, keys = packet_sizes(full)
+            cuts = size_cuts(pkts, keys, n) if n > 1 else []
+            for old in dest_dir.glob(f"{src.stem}_part*.mp4"):
+                old.unlink()
+            r = run(split_copy_cmd(full, cuts, pattern))
+            if _cancel.is_set():
+                raise Stopped()
+            if r.returncode != 0:
+                raise RuntimeError(r.stderr.strip()[-400:])
+            clips = sorted(dest_dir.glob(f"{src.stem}_part*.mp4"))
+            if all(c.stat().st_size <= limit for c in clips):
+                break
+            n += 1
+        else:
+            raise RuntimeError(f"could not get every clip under {fmt_size(limit)}")
+    finally:
+        if full.exists():
+            full.unlink()
+    bounds = [0] + cuts + [info["duration"]]
+    longest = max(b - a for a, b in zip(bounds, bounds[1:]))
+    biggest = max(c.stat().st_size for c in clips)
+    return (f"{len(clips)} clip(s), each up to {fmt_size(biggest)} and {fmt_time(longest)} long",
+            mode)
+
+
+def estimate_whatsapp_clips(info, args):
+    """Rough clip count for --dry-run; the real count is only known after encoding."""
+    h = min(args.wa_height, info["height"] or args.wa_height)
+    mbps = 1.2 if h <= 480 else 2.5 if h <= 720 else 5.0  # typical H.264 at CRF 26, plus audio
+    est = info["duration"] * (mbps + 0.128) * 1e6 / 8
+    return max(1, math.ceil(est / (args.wa_limit_mb * 1_000_000 * WA_MARGIN)))
 
 
 def process(src, root, out_dir, profiles, args, emit=print, activity=None):
@@ -387,32 +503,41 @@ def process(src, root, out_dir, profiles, args, emit=print, activity=None):
             results.append(f"{profile}: already done, skipped")
             continue
 
-        pattern = dest_dir / f"{src.stem}_part%02d.mp4"
-        cmd, mode = build_cmd(src, info, pattern, profile, args.seg_sec,
-                              args.exact, args.wa_crf, args.yt_crf, args.wa_height)
         if args.dry_run:
-            results.append(f"{profile}: would create ~{n_parts} clip(s) in {dest_dir} [{mode}]")
+            if profile == "youtube":
+                _, mode = youtube_cmd(src, info, "", args.seg_sec, args.exact, args.yt_crf)
+                plan = f"~{n_parts} clip(s)"
+            else:
+                _, mode = whatsapp_encode_cmd(src, info, "", args.wa_crf, args.wa_height)
+                plan = (f"about {estimate_whatsapp_clips(info, args)} clip(s) under "
+                        f"{fmt_size(args.wa_limit_mb * 1_000_000)} (exact count known after encoding)")
+            results.append(f"{profile}: would create {plan} in {dest_dir} [{mode}]")
             continue
 
         if _cancel.is_set():
             return label, False, "stopped"
         dest_dir.mkdir(parents=True, exist_ok=True)
-        for old in dest_dir.glob(f"{src.stem}_part*.mp4"):
-            old.unlink()
         t0 = time.time()
-        r = run(cmd)
-        if _cancel.is_set():
-            return label, False, f"{profile}: stopped (partial clips left, will redo next time)"
-        if r.returncode != 0:
-            return label, False, f"{profile} failed: {r.stderr.strip()[-400:]}"
-
-        clips = sorted(dest_dir.glob(f"{src.stem}_part*.mp4"))
-        big = [c for c in clips if c.stat().st_size > 2 * 1024**3]
+        if profile == "whatsapp":
+            try:
+                made, mode = make_whatsapp(src, info, dest_dir, args, activity)
+            except Stopped:
+                return label, False, "whatsapp: stopped (will redo next time)"
+            except Exception as e:
+                return label, False, f"whatsapp failed: {e}"
+        else:
+            for old in dest_dir.glob(f"{src.stem}_part*.mp4"):
+                old.unlink()
+            cmd, mode = youtube_cmd(src, info, dest_dir / f"{src.stem}_part%02d.mp4",
+                                    args.seg_sec, args.exact, args.yt_crf)
+            r = run(cmd)
+            if _cancel.is_set():
+                return label, False, f"{profile}: stopped (partial clips left, will redo next time)"
+            if r.returncode != 0:
+                return label, False, f"{profile} failed: {r.stderr.strip()[-400:]}"
+            made = f"{len(list(dest_dir.glob(f'{src.stem}_part*.mp4')))} clip(s)"
         done_marker.write_text(time.strftime("%Y-%m-%d %H:%M:%S"))
-        msg = f"{profile}: {len(clips)} clip(s) in {time.time() - t0:.0f}s [{mode}]"
-        if profile == "whatsapp" and big:
-            msg += f"  WARNING: {len(big)} clip(s) over WhatsApp's 2 GB limit — try --wa-crf 30"
-        results.append(msg)
+        results.append(f"{profile}: {made} in {time.time() - t0:.0f}s [{mode}]")
 
     if args.upload and yt_dir:
         if args.dry_run:
@@ -433,12 +558,16 @@ def process(src, root, out_dir, profiles, args, emit=print, activity=None):
 # ---------------------------------------------------------------- batch
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
-        description="Batch-split videos into 15-minute clips for WhatsApp and YouTube.",
+        description="Batch-split videos into clips for WhatsApp and YouTube.",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split("Examples")[1])
     ap.add_argument("inputs", nargs="+", help="Video files and/or folders (searched recursively)")
     ap.add_argument("-o", "--output", required=True, help="Folder to write clips into")
     ap.add_argument("--profile", choices=["both", "youtube", "whatsapp"], default="both")
-    ap.add_argument("--minutes", type=float, default=15, help="Clip length in minutes (default 15)")
+    ap.add_argument("--minutes", type=float, default=15,
+                    help="YouTube clip length in minutes (default 15)")
+    ap.add_argument("--wa-limit-mb", type=float, default=2000,
+                    help="WhatsApp max file size per clip in MB. 2000 (default) = 2 GB, for sending "
+                         "as a Document; 64 = for sending as a normal video that plays in the chat")
     ap.add_argument("--jobs", type=int, default=1,
                     help="Videos to process at once (default 1; re-encoding already uses all CPU cores)")
     ap.add_argument("--exact", action="store_true",
@@ -463,6 +592,10 @@ def parse_args(argv=None):
     args = ap.parse_args(argv)
     if args.upload and args.profile == "whatsapp":
         ap.error("--upload uploads the YouTube clips, so use --profile youtube or both")
+    if args.minutes <= 0:
+        ap.error("--minutes must be above 0")
+    if args.wa_limit_mb < 5:
+        ap.error("--wa-limit-mb must be at least 5")
     args.seg_sec = int(args.minutes * 60)
     return args
 
@@ -476,8 +609,13 @@ def run_batch(args, emit=print, progress=None, activity=None):
     videos = [(f, r) for f, r in find_videos(args.inputs, emit) if out_dir not in f.parents]
     if not videos:
         return None
+    sizes = []
+    if "youtube" in profiles:
+        sizes.append(f"YouTube clips: {args.minutes:g} min")
+    if "whatsapp" in profiles:
+        sizes.append(f"WhatsApp clips: up to {fmt_size(args.wa_limit_mb * 1_000_000)}")
     emit(f"Found {len(videos)} video(s). Output: {out_dir}  Profile: {args.profile}  "
-         f"Clip length: {args.minutes:g} min\n")
+         + "  ".join(sizes) + "\n")
     if args.upload and not args.dry_run:
         emit("Signing in to YouTube (your browser opens the first time)…")
         _yt["blocked"] = None
@@ -592,26 +730,37 @@ def gui():
         ttk.Radiobutton(opts, text=text, value=val, variable=prof_var).grid(
             row=0, column=col, sticky="w", padx=(8, 0))
     min_var = tk.StringVar(value="15")
-    ttk.Label(opts, text="Clip length (minutes):").grid(row=1, column=0, sticky="w", pady=(8, 0))
-    ttk.Spinbox(opts, from_=1, to=240, width=6, textvariable=min_var).grid(
-        row=1, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+    ttk.Label(opts, text="YouTube clip length (minutes):").grid(row=1, column=0, sticky="w",
+                                                               pady=(8, 0))
+    min_spin = ttk.Spinbox(opts, from_=1, to=240, width=6, textvariable=min_var)
+    min_spin.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+    limit_var = tk.StringVar(value=next(iter(WA_LIMITS)))
+    ttk.Label(opts, text="WhatsApp max file size:").grid(row=2, column=0, sticky="w", pady=(8, 0))
+    limit_box = ttk.Combobox(opts, values=list(WA_LIMITS), width=24, state="readonly",
+                             textvariable=limit_var)
+    limit_box.grid(row=2, column=1, columnspan=3, sticky="w", padx=(8, 0), pady=(8, 0))
     h_var = tk.StringVar(value="720")
-    ttk.Label(opts, text="WhatsApp max height:").grid(row=2, column=0, sticky="w", pady=(8, 0))
-    ttk.Combobox(opts, values=["480", "720", "1080"], width=6, state="readonly",
-                 textvariable=h_var).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+    ttk.Label(opts, text="WhatsApp max height:").grid(row=3, column=0, sticky="w", pady=(8, 0))
+    h_box = ttk.Combobox(opts, values=["480", "720", "1080"], width=6, state="readonly",
+                         textvariable=h_var)
+    h_box.grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
     up_var = tk.BooleanVar(value=False)
     up_chk = ttk.Checkbutton(opts, text="Upload YouTube clips to my channel", variable=up_var)
-    up_chk.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+    up_chk.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
     priv_var = tk.StringVar(value="private")
     priv_box = ttk.Combobox(opts, values=["private", "unlisted", "public"], width=9,
                             state="readonly", textvariable=priv_var)
-    priv_box.grid(row=3, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
+    priv_box.grid(row=4, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
     pl_var = tk.BooleanVar(value=True)
     pl_chk = ttk.Checkbutton(opts, text="Parts in a playlist", variable=pl_var)
-    pl_chk.grid(row=3, column=3, sticky="w", padx=(8, 0), pady=(8, 0))
+    pl_chk.grid(row=4, column=3, sticky="w", padx=(8, 0), pady=(8, 0))
 
     def sync_upload(*_):
         can = prof_var.get() != "whatsapp"
+        wa = prof_var.get() != "youtube"
+        min_spin.configure(state="normal" if can else "disabled")
+        for box in (limit_box, h_box):
+            box.configure(state="readonly" if wa else "disabled")
         up_chk.configure(state="normal" if can else "disabled")
         on = can and up_var.get()
         priv_box.configure(state="readonly" if on else "disabled")
@@ -679,7 +828,8 @@ def gui():
             if minutes <= 0:
                 raise ValueError
         except ValueError:
-            messagebox.showwarning("Clip length", "Clip length must be a number of minutes above 0.")
+            messagebox.showwarning("Clip length",
+                                   "YouTube clip length must be a number of minutes above 0.")
             return
         missing = missing_tools()
         if missing:
@@ -710,6 +860,7 @@ def gui():
                 extra += ["--yt-secrets", str(secrets)]
 
         args = parse_args(["-o", out, "--profile", prof_var.get(), "--minutes", str(minutes),
+                           "--wa-limit-mb", str(WA_LIMITS[limit_var.get()]),
                            "--wa-height", h_var.get()] + extra + ["--"] + inputs)
         _cancel.clear()
         set_running(True)
