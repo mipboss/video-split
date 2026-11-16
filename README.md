@@ -1,5 +1,8 @@
 # Video Splitter
 
+**[⬇ Download VideoSplitter.exe for Windows](https://github.com/mipboss/video-split/releases/latest/download/VideoSplitter.exe)**
+(no installation needed)
+
 Splits videos into clips ready to share on WhatsApp and YouTube. You can add
 single videos or whole folders, and it works through them in one go.
 
