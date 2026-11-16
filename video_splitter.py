@@ -20,6 +20,9 @@ Examples
   # See what would happen without doing anything
   python video_splitter.py ~/Movies -o ~/Clips --dry-run
 
+  # Split for YouTube and upload as unlisted, each video's parts in a playlist
+  python video_splitter.py ~/Movies -o ~/Clips --profile youtube --upload --privacy unlisted --playlist
+
 Profiles
   youtube   Keeps original quality. Streams are copied (no re-encode) when the
             source is already H.264/H.265 + AAC, which is very fast. Cuts land on
@@ -30,6 +33,29 @@ Profiles
             plays on any phone. Clips are cut exactly at 15:00.
             Use --wa-height 1080 to keep full HD (bigger files).
   both      (default) produces both, in separate sub-folders.
+
+YouTube upload (optional, --upload or the checkbox in the window)
+  Uploads the YouTube clips to your channel, titled "<video> - Part 1 of 3".
+  Uploaded clips are remembered, so re-running only uploads what's missing.
+  One-time setup:
+    1. pip install google-api-python-client google-auth-oauthlib
+    2. In https://console.cloud.google.com create a project, then:
+       - APIs & Services > Library: enable "YouTube Data API v3"
+       - OAuth consent screen: choose External, and add your Google account
+         as a test user
+       - Credentials > Create credentials > OAuth client ID > "Desktop app",
+         then download the JSON file
+    3. Save that file as ~/.video_splitter/client_secret.json (or next to this
+       script, or pass --yt-secrets). The window asks for it if it's missing.
+    4. The first upload opens your browser so you can sign in and allow access.
+  Good to know:
+    - YouTube locks videos uploaded through a new, unreviewed Google project to
+      Private. You can change them to Public in YouTube Studio, or apply for
+      YouTube's API audit to lift the limit.
+    - The free API quota allows only a few uploads per day. When it runs out,
+      run the script again the next day and it continues where it stopped.
+    - While the project is in "Testing" mode, Google asks you to sign in again
+      about once a week.
 """
 
 import argparse
@@ -53,11 +79,15 @@ _procs = set()               # running ffmpeg processes, so Stop can kill them
 
 
 # ---------------------------------------------------------------- helpers
+def app_dir():
+    """Folder holding this script (or the bundled files of a packaged exe)."""
+    return Path(getattr(sys, "_MEIPASS", Path(sys.argv[0]).resolve().parent))
+
+
 def tool(name):
     """Use ffmpeg/ffprobe bundled next to the script or exe if present, else the one on PATH."""
     exe = name + (".exe" if os.name == "nt" else "")
-    base = Path(getattr(sys, "_MEIPASS", Path(sys.argv[0]).resolve().parent))
-    bundled = base / exe
+    bundled = app_dir() / exe
     return str(bundled) if bundled.exists() else name
 
 
@@ -129,6 +159,175 @@ def fmt_time(sec):
     return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
 
 
+# ---------------------------------------------------------------- youtube upload
+CONFIG_DIR = Path.home() / ".video_splitter"
+YT_TOKEN = CONFIG_DIR / "youtube_token.json"
+YT_SCOPES = ["https://www.googleapis.com/auth/youtube"]  # upload videos + manage playlists
+YT_PACKAGES = "google-api-python-client google-auth-oauthlib"
+YT_QUOTA_REASONS = {"quotaExceeded", "uploadLimitExceeded", "dailyLimitExceeded"}
+YT_RETRY_STATUS = {500, 502, 503, 504}
+
+
+class Stopped(Exception):
+    pass
+
+
+_yt = {"service": None, "blocked": None}
+_yt_lock = threading.Lock()  # one upload at a time; the API client isn't thread-safe
+
+
+def yt_packages_missing():
+    import importlib.util
+    return any(importlib.util.find_spec(m) is None for m in ("googleapiclient", "google_auth_oauthlib"))
+
+
+def yt_install_hint():
+    py = f'"{sys.executable}" -m pip install'
+    return f"{py} --upgrade pip && {py} {YT_PACKAGES}"  # old pips pick incompatible versions
+
+
+def find_client_secrets(explicit=None):
+    if explicit:
+        p = Path(explicit).expanduser()
+        return p if p.is_file() else None
+    return next((p for p in (CONFIG_DIR / "client_secret.json", app_dir() / "client_secret.json")
+                 if p.is_file()), None)
+
+
+def youtube_login(secrets):
+    """Return a YouTube API client. Opens the browser to sign in when there's no saved sign-in."""
+    if yt_packages_missing():
+        raise RuntimeError("YouTube upload needs extra Python packages. Install them with:\n  "
+                           + yt_install_hint())
+    from google.auth.exceptions import RefreshError
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.discovery import build
+
+    creds = None
+    if YT_TOKEN.exists():
+        try:
+            creds = Credentials.from_authorized_user_file(str(YT_TOKEN), YT_SCOPES)
+        except ValueError:
+            creds = None
+    if creds and not creds.valid and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+        except RefreshError:  # revoked, or expired (Testing-mode projects expire after 7 days)
+            creds = None
+    if not creds or not creds.valid:
+        if secrets is None:
+            raise RuntimeError("No YouTube client_secret.json found. See 'YouTube upload' at the "
+                               "top of video_splitter.py for the one-time setup.")
+        try:
+            flow = InstalledAppFlow.from_client_secrets_file(str(secrets), YT_SCOPES)
+            creds = flow.run_local_server(port=0, timeout_seconds=300)
+        except Exception as e:
+            raise RuntimeError(f"YouTube sign-in did not finish: {e}")
+        if not creds or not creds.valid:
+            raise RuntimeError("YouTube sign-in did not finish (timed out after 5 minutes).")
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    YT_TOKEN.write_text(creds.to_json(), encoding="utf-8")
+    YT_TOKEN.chmod(0o600)
+    return build("youtube", "v3", credentials=creds, cache_discovery=False)
+
+
+def _error_info(e):
+    try:
+        err = json.loads(e.content.decode("utf-8", "replace"))["error"]
+        return (err.get("errors") or [{}])[0].get("reason", ""), err.get("message", "")
+    except Exception:
+        return "", ""
+
+
+def _api_call(fn):
+    """Run one YouTube request, retrying network hiccups and YouTube server errors."""
+    import httplib2
+    from googleapiclient.errors import HttpError
+    for attempt in range(8):
+        try:
+            return fn()
+        except HttpError as e:
+            reason, message = _error_info(e)
+            if reason in YT_QUOTA_REASONS:
+                _yt["blocked"] = ("YouTube's daily upload quota is used up. Run again tomorrow to "
+                                  "upload the rest; clips already uploaded are skipped.")
+                raise RuntimeError(_yt["blocked"])
+            if e.resp.status not in YT_RETRY_STATUS or attempt == 7:
+                raise RuntimeError(f"YouTube error {e.resp.status} {reason}: {message}".strip())
+        except (OSError, httplib2.HttpLib2Error):
+            if attempt == 7:
+                raise
+        if _cancel.wait(min(2 ** attempt, 60)):
+            raise Stopped()
+
+
+def upload_clips(dest_dir, name, args, emit, activity):
+    """Upload clips in dest_dir that aren't on YouTube yet; progress is kept in .uploaded.json."""
+    if _yt["blocked"]:
+        raise RuntimeError(_yt["blocked"])
+    from googleapiclient.http import MediaFileUpload
+
+    yt = _yt["service"]
+    clips = sorted(dest_dir.glob(f"{name}_part*.mp4"))
+    if not clips:
+        raise RuntimeError("no clips found to upload")
+    state_file = dest_dir / ".uploaded.json"
+    state = json.loads(state_file.read_text(encoding="utf-8")) if state_file.exists() else {}
+    ids = state.setdefault("videos", {})
+    in_playlist = state.setdefault("in_playlist", [])
+
+    def save():
+        state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    title = name.replace("<", "").replace(">", "").strip() or "Video"  # YouTube rejects < >
+    n, new = len(clips), 0
+    for i, clip in enumerate(clips, 1):
+        if clip.name in ids:
+            continue
+        if _cancel.is_set():
+            raise Stopped()
+        suffix = f" - Part {i} of {n}" if n > 1 else ""
+        body = {"snippet": {"title": title[:100 - len(suffix)] + suffix, "categoryId": "22"},
+                "status": {"privacyStatus": args.privacy}}
+        media = MediaFileUpload(str(clip), mimetype="video/mp4", chunksize=8 * 1024 * 1024,
+                                resumable=True)
+        req = yt.videos().insert(part="snippet,status", body=body, media_body=media)
+        resp = None
+        while resp is None:
+            if _cancel.is_set():
+                raise Stopped()
+            status, resp = _api_call(req.next_chunk)
+            if status and activity:
+                activity(f"Uploading {clip.name}: {int(status.progress() * 100)}%")
+        ids[clip.name] = resp["id"]
+        save()
+        new += 1
+        emit(f"    uploaded {clip.name} -> https://youtu.be/{resp['id']}")
+
+    msg = f"{new} clip(s) uploaded as {args.privacy}"
+    if n - new:
+        msg += f", {n - new} already on YouTube"
+    if args.playlist and n > 1:
+        if not state.get("playlist"):
+            resp = _api_call(yt.playlists().insert(part="snippet,status", body={
+                "snippet": {"title": title[:150]},
+                "status": {"privacyStatus": args.privacy}}).execute)
+            state["playlist"] = resp["id"]
+            save()
+        for clip in clips:
+            vid = ids[clip.name]
+            if vid not in in_playlist:
+                _api_call(yt.playlistItems().insert(part="snippet", body={"snippet": {
+                    "playlistId": state["playlist"],
+                    "resourceId": {"kind": "youtube#video", "videoId": vid}}}).execute)
+                in_playlist.append(vid)
+                save()
+        msg += f", playlist https://www.youtube.com/playlist?list={state['playlist']}"
+    return msg
+
+
 # ---------------------------------------------------------------- core
 def build_cmd(src, info, out_pattern, profile, seg_sec, exact, crf_wa, crf_yt, wa_height):
     base = [tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
@@ -165,7 +364,7 @@ def build_cmd(src, info, out_pattern, profile, seg_sec, exact, crf_wa, crf_yt, w
     return base + codec + seg, mode
 
 
-def process(src, root, out_dir, profiles, args):
+def process(src, root, out_dir, profiles, args, emit=print, activity=None):
     rel = src.relative_to(root)
     label = str(rel)
     if _cancel.is_set():
@@ -177,9 +376,12 @@ def process(src, root, out_dir, profiles, args):
 
     n_parts = max(1, -(-int(info["duration"]) // args.seg_sec))
     results = []
+    yt_dir = None
     for profile in profiles:
         sub = out_dir / profile if len(profiles) > 1 else out_dir
         dest_dir = sub / rel.parent / src.stem
+        if profile == "youtube":
+            yt_dir = dest_dir
         done_marker = dest_dir / ".done"
         if done_marker.exists() and not args.overwrite:
             results.append(f"{profile}: already done, skipped")
@@ -212,6 +414,19 @@ def process(src, root, out_dir, profiles, args):
             msg += f"  WARNING: {len(big)} clip(s) over WhatsApp's 2 GB limit — try --wa-crf 30"
         results.append(msg)
 
+    if args.upload and yt_dir:
+        if args.dry_run:
+            results.append(f"upload: would upload ~{n_parts} clip(s) to YouTube as {args.privacy}")
+        else:
+            prefix = f"({fmt_time(info['duration'])}) " + " | ".join(results)
+            try:
+                with _yt_lock:
+                    results.append("upload: " + upload_clips(yt_dir, src.stem, args, emit, activity))
+            except Stopped:
+                return label, False, prefix + " | upload: stopped (will continue next time)"
+            except Exception as e:
+                return label, False, prefix + f" | upload failed: {e}"
+
     return label, True, f"({fmt_time(info['duration'])}) " + " | ".join(results)
 
 
@@ -236,13 +451,25 @@ def parse_args(argv=None):
                     help="YouTube quality when re-encoding, lower = better. Default 18")
     ap.add_argument("--overwrite", action="store_true", help="Redo videos already processed")
     ap.add_argument("--dry-run", action="store_true", help="Show the plan without converting")
+    yt = ap.add_argument_group("YouTube upload (one-time setup described below)")
+    yt.add_argument("--upload", action="store_true", help="Upload the YouTube clips to your channel")
+    yt.add_argument("--privacy", choices=["private", "unlisted", "public"], default="private",
+                    help="Visibility of uploaded clips (default private)")
+    yt.add_argument("--playlist", action="store_true",
+                    help="Put each video's parts into their own YouTube playlist")
+    yt.add_argument("--yt-secrets", metavar="FILE",
+                    help="OAuth client JSON from Google Cloud (default: "
+                         "~/.video_splitter/client_secret.json or next to this script)")
     args = ap.parse_args(argv)
+    if args.upload and args.profile == "whatsapp":
+        ap.error("--upload uploads the YouTube clips, so use --profile youtube or both")
     args.seg_sec = int(args.minutes * 60)
     return args
 
 
-def run_batch(args, emit=print, progress=None):
-    """Split every video in args.inputs. Returns (ok, fail), or None if no videos were found."""
+def run_batch(args, emit=print, progress=None, activity=None):
+    """Split every video in args.inputs. Returns (ok, fail), or None if no videos were found.
+    Raises RuntimeError if YouTube upload was asked for but sign-in fails."""
     out_dir = Path(args.output).expanduser().resolve()
     profiles = ["youtube", "whatsapp"] if args.profile == "both" else [args.profile]
 
@@ -251,12 +478,18 @@ def run_batch(args, emit=print, progress=None):
         return None
     emit(f"Found {len(videos)} video(s). Output: {out_dir}  Profile: {args.profile}  "
          f"Clip length: {args.minutes:g} min\n")
+    if args.upload and not args.dry_run:
+        emit("Signing in to YouTube (your browser opens the first time)…")
+        _yt["blocked"] = None
+        _yt["service"] = youtube_login(find_client_secrets(args.yt_secrets))
+        emit(f"Signed in. Clips will be uploaded as {args.privacy}.\n")
 
     ok = fail = 0
     log_lines = []
     t_start = time.time()
     with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-        futs = {pool.submit(process, f, r, out_dir, profiles, args): f for f, r in videos}
+        futs = {pool.submit(process, f, r, out_dir, profiles, args, emit, activity): f
+                for f, r in videos}
         for i, fut in enumerate(as_completed(futs), 1):
             label, success, msg = fut.result()
             status = "OK  " if success else "FAIL"
@@ -293,7 +526,7 @@ def gui():
 
     root = tk.Tk()
     root.title("Video Splitter")
-    root.minsize(600, 560)
+    root.minsize(640, 600)
     events = queue.Queue()  # worker thread -> GUI; Tk widgets may only be touched from here
     running = [False]
 
@@ -366,6 +599,27 @@ def gui():
     ttk.Label(opts, text="WhatsApp max height:").grid(row=2, column=0, sticky="w", pady=(8, 0))
     ttk.Combobox(opts, values=["480", "720", "1080"], width=6, state="readonly",
                  textvariable=h_var).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+    up_var = tk.BooleanVar(value=False)
+    up_chk = ttk.Checkbutton(opts, text="Upload YouTube clips to my channel", variable=up_var)
+    up_chk.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+    priv_var = tk.StringVar(value="private")
+    priv_box = ttk.Combobox(opts, values=["private", "unlisted", "public"], width=9,
+                            state="readonly", textvariable=priv_var)
+    priv_box.grid(row=3, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
+    pl_var = tk.BooleanVar(value=True)
+    pl_chk = ttk.Checkbutton(opts, text="Parts in a playlist", variable=pl_var)
+    pl_chk.grid(row=3, column=3, sticky="w", padx=(8, 0), pady=(8, 0))
+
+    def sync_upload(*_):
+        can = prof_var.get() != "whatsapp"
+        up_chk.configure(state="normal" if can else "disabled")
+        on = can and up_var.get()
+        priv_box.configure(state="readonly" if on else "disabled")
+        pl_chk.configure(state="normal" if on else "disabled")
+
+    prof_var.trace_add("write", sync_upload)
+    up_var.trace_add("write", sync_upload)
+    sync_upload()
 
     # --- run controls
     ctl = ttk.Frame(frm)
@@ -433,8 +687,30 @@ def gui():
                                  "or put ffmpeg and ffprobe next to this program.")
             return
 
+        extra = []
+        if up_var.get() and prof_var.get() != "whatsapp":
+            if yt_packages_missing():
+                messagebox.showerror("YouTube upload", "Uploading needs extra Python packages. "
+                                     "Run this in Terminal, then try again:\n\n" + yt_install_hint())
+                return
+            secrets = find_client_secrets()
+            if secrets is None and not YT_TOKEN.exists():
+                messagebox.showinfo("YouTube upload", "Choose the client_secret JSON file you "
+                                    "downloaded from Google Cloud (see the setup steps at the top "
+                                    "of video_splitter.py).")
+                chosen = filedialog.askopenfilename(title="Choose client_secret JSON",
+                                                    filetypes=[("JSON", "*.json")])
+                if not chosen:
+                    return
+                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                secrets = CONFIG_DIR / "client_secret.json"
+                shutil.copyfile(chosen, secrets)
+            extra = ["--upload", "--privacy", priv_var.get()] + (["--playlist"] if pl_var.get() else [])
+            if secrets:
+                extra += ["--yt-secrets", str(secrets)]
+
         args = parse_args(["-o", out, "--profile", prof_var.get(), "--minutes", str(minutes),
-                           "--wa-height", h_var.get(), "--"] + inputs)
+                           "--wa-height", h_var.get()] + extra + ["--"] + inputs)
         _cancel.clear()
         set_running(True)
         open_btn.configure(state="disabled")
@@ -446,7 +722,8 @@ def gui():
         def work():
             try:
                 result = run_batch(args, emit=lambda s: events.put(("log", s)),
-                                   progress=lambda i, n: events.put(("status", f"{i} of {n} videos done")))
+                                   progress=lambda i, n: events.put(("status", f"{i} of {n} videos done")),
+                                   activity=lambda s: events.put(("status", s)))
             except Exception as e:
                 events.put(("log", f"ERROR: {e}"))
                 result = (0, 1)
@@ -509,7 +786,13 @@ def main():
     if missing:
         sys.exit(f"ERROR: {', '.join(missing)} not found on PATH. Install ffmpeg first "
                  "(see the top of this script for instructions).")
-    result = run_batch(args, emit=lambda s: print(s, flush=True))
+    try:
+        result = run_batch(args, emit=lambda s: print(s, flush=True))
+    except RuntimeError as e:
+        sys.exit(f"ERROR: {e}")
+    except KeyboardInterrupt:
+        stop()
+        sys.exit("\nStopped.")
     if result is None:
         sys.exit("No video files found.")
     sys.exit(1 if result[1] else 0)
